@@ -1,7 +1,13 @@
-const express=require("express"),http=require("http"),WebSocket=require("ws"),crypto=require("crypto");
+const express=require("express"),http=require("http"),WebSocket=require("ws"),crypto=require("crypto"),fs=require("fs"),path=require("path");
 const app=express();app.use(express.static("public"));app.get("/health",(_,r)=>r.json({ok:true}));
 const server=http.createServer(app),wss=new WebSocket.Server({server});
 const WORLD={w:2600,h:1800},players=new Map(),mobs=[];
+const DATA_DIR=process.env.DATA_DIR||".data", SAVE_FILE=path.join(DATA_DIR,"characters.json");
+fs.mkdirSync(DATA_DIR,{recursive:true});
+let saved={}; try{saved=JSON.parse(fs.readFileSync(SAVE_FILE,"utf8"))||{}}catch{}
+function persist(){try{fs.writeFileSync(SAVE_FILE,JSON.stringify(saved,null,2))}catch(e){console.error("save failed",e.message)}}
+function safeName(v){return String(v||"모험가").trim().slice(0,12)||"모험가"}
+function savePlayer(p){if(!p)return;saved[p.name.toLowerCase()]={name:p.name,classId:p.classId,level:p.level,xp:p.xp,gold:p.gold,hp:p.hp,maxHp:p.maxHp,inventory:p.inventory,equip:p.equip};persist()}
 const rand=(a,b)=>Math.floor(Math.random()*(b-a+1))+a,clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 const classes={
  warrior:{label:"고회장 · 전사",hp:180,atk:24,def:12,range:92,speed:3.1,skill:"강타",color:"#e3b65b"},
@@ -25,7 +31,11 @@ const itemDefs={
 };
 function addItem(p,id,n=1){let d=itemDefs[id];if(!d)return;let found=p.inventory.find(i=>i.id===id&&["material","scroll","consumable"].includes(d.type));if(found)found.qty+=n;else p.inventory.push({id,qty:n,enhance:0});}
 function itemView(i){return {...i,...itemDefs[i.id]};}
-function initMobs(){mobs.length=0;for(let i=0;i<38;i++){let gob=i%3===0;mobs.push({id:"mob"+i,type:gob?"goblin":"slime",name:gob?"고블린":"숲 슬라임",x:rand(170,WORLD.w-170),y:rand(170,WORLD.h-170),hp:gob?100:58,maxHp:gob?100:58,atk:gob?13:8,def:gob?5:2,range:gob?42:35,alive:true,respawnAt:0,lastAtk:0,aggro:null});}}
+function initMobs(){mobs.length=0;const kinds=[
+ ["slime","숲 슬라임",58,8,2],["goblin","고블린",100,13,5],["wolf","숲 늑대",125,16,6],
+ ["orc","오크 전사",190,22,9],["skeleton","해골 기사",260,27,13],["spider","거대 거미",310,30,12],
+ ["deathknight","데스나이트",620,42,22],["fire","불의 정령",480,38,17],["dragon","고대 드래곤",1800,68,32],["boss","필드 보스",2400,78,38]];
+ for(let i=0;i<50;i++){let k=kinds[i<20?0:i<30?1:i<36?2:i<41?3:i<45?4:i<47?5:i<48?6:i<49?7:8];mobs.push({id:"mob"+i,type:k[0],name:k[1],x:rand(170,WORLD.w-170),y:rand(170,WORLD.h-170),hp:k[2],maxHp:k[2],atk:k[3],def:k[4],range:42,alive:true,respawnAt:0,lastAtk:0,aggro:null});}}
 initMobs();
 function send(ws,o){if(ws.readyState===1)ws.send(JSON.stringify(o));}
 function pubPlayer(p){return {id:p.id,name:p.name,classId:p.classId,className:classes[p.classId].label,x:p.x,y:p.y,hp:p.hp,maxHp:p.maxHp,level:p.level,xp:p.xp,gold:p.gold,atk:stat(p).atk,def:stat(p).def,inventory:p.inventory.map(itemView),equip:p.equip,skillCd:Math.max(0,p.skillCd-Date.now())};}
@@ -36,7 +46,11 @@ function drop(p,m,ws){let gold=rand(m.type==="goblin"?8:3,m.type==="goblin"?24:1
 function attack(p,ws,skill){let c=classes[p.classId],now=Date.now();if(skill&&now<p.skillCd){notice(ws,"스킬 재사용 대기 중입니다.");return;}let s=stat(p);let target=mobs.filter(m=>m.alive&&Math.hypot(m.x-p.x,m.y-p.y)<(skill?c.range*1.18:c.range)).sort((a,b)=>Math.hypot(a.x-p.x,a.y-p.y)-Math.hypot(b.x-p.x,b.y-p.y))[0];if(!target){notice(ws,"사정거리 안에 몬스터가 없습니다.");return;}if(skill)p.skillCd=now+(p.classId==="healer"?7000:5500);let dmg=Math.max(1,Math.round(s.atk*(skill?(p.classId==="warrior"?2.0:p.classId==="archer"?1.65:p.classId==="mage"?2.25:1.35):1)*(rand(85,115)/100))-target.def);target.hp=Math.max(0,target.hp-dmg);notice(ws,`${skill?c.skill:"공격"}! ${target.name}에게 ${dmg} 피해`);if(target.hp<=0){target.alive=false;target.respawnAt=Date.now()+8000;drop(p,target,ws);}}
 wss.on("connection",ws=>{let id=crypto.randomUUID(),p=null;send(ws,{type:"hello",classes:Object.entries(classes).map(([id,c])=>({id,...c}))});
 ws.on("message",raw=>{let m;try{m=JSON.parse(raw)}catch{return}
-if(m.type==="join"){if(p)return;let classId=classes[m.classId]?m.classId:"warrior";p={id,name:String(m.name||"모험가").trim().slice(0,12)||"모험가",classId,x:WORLD.w/2+rand(-50,50),y:WORLD.h/2+rand(-50,50),level:1,xp:0,gold:100,hp:classes[classId].hp,maxHp:classes[classId].hp,inventory:[],equip:{weapon:null,armor:null,accessory:null},lastAttack:0,skillCd:0,lastMove:0};addItem(p,classId==="warrior"?"iron_sword":classId==="archer"?"oak_bow":classId==="mage"?"apprentice_staff":"cleric_mace");addItem(p,"potion",3);players.set(id,p);ws._playerId=id;send(ws,{type:"joined",id,player:pubPlayer(p)});return;}
+if(m.type==="join"){if(p)return;const name=safeName(m.name),key=name.toLowerCase(),old=saved[key];let classId=old&&classes[old.classId]?old.classId:(classes[m.classId]?m.classId:"warrior");
+if(old&&m.classId&&m.classId!==old.classId)notice(ws,"기존 캐릭터의 직업은 변경할 수 없습니다.");
+p={id,name,classId,x:WORLD.w/2+rand(-50,50),y:WORLD.h/2+rand(-50,50),level:old?.level||1,xp:old?.xp||0,gold:old?.gold??100,hp:old?.hp||classes[classId].hp,maxHp:old?.maxHp||classes[classId].hp,inventory:old?.inventory||[],equip:old?.equip||{weapon:null,armor:null,accessory:null},lastAttack:0,skillCd:0,lastMove:0};
+if(!old){addItem(p,classId==="warrior"?"iron_sword":classId==="archer"?"oak_bow":classId==="mage"?"apprentice_staff":"cleric_mace");addItem(p,"potion",3);}
+players.set(id,p);ws._playerId=id;savePlayer(p);send(ws,{type:"joined",id,player:pubPlayer(p)});return;}
 if(!p)return;
 if(m.type==="name")p.name=String(m.name||"모험가").trim().slice(0,12)||"모험가";
 if(m.type==="move"){let dx=clamp(Number(m.dx)||0,-1,1),dy=clamp(Number(m.dy)||0,-1,1),len=Math.hypot(dx,dy)||1,c=classes[p.classId];p.x=clamp(p.x+dx/len*c.speed,25,WORLD.w-25);p.y=clamp(p.y+dy/len*c.speed,25,WORLD.h-25);}
@@ -45,9 +59,11 @@ if(m.type==="equip"){let i=p.inventory.find(i=>i.id===m.id),d=i&&itemDefs[i.id];
 if(m.type==="use"){let i=p.inventory.find(i=>i.id===m.id),d=i&&itemDefs[i.id];if(!i)return;if(d.type==="consumable"&&m.id==="potion"){p.hp=Math.min(p.maxHp,p.hp+Math.ceil(p.maxHp*.45));i.qty--;notice(ws,"회복 물약 사용!");}
 else if(d.type==="scroll"){let slot=d.target,eq=p.equip[slot];if(!eq){notice(ws,`${slot==="weapon"?"무기":slot==="armor"?"방어구":"장신구"}를 먼저 장착하세요.`);return;}if(Math.random()<.78){eq.enhance=(eq.enhance||0)+1;notice(ws,`✨ 강화 성공! ${itemDefs[eq.id].name} +${eq.enhance}`);}else notice(ws,"강화 실패! 아이템은 유지되었습니다.");i.qty--;}
 else{notice(ws,"이 아이템은 사용할 수 없습니다.");return;}if(i.qty<=0)p.inventory.splice(p.inventory.indexOf(i),1);}
+savePlayer(p);
 });
 ws.on("close",()=>{if(p)players.delete(id);});});
 setInterval(()=>{let now=Date.now();for(let m of mobs){if(!m.alive&&m.respawnAt<=now){m.alive=true;m.hp=m.maxHp;m.x=rand(160,WORLD.w-160);m.y=rand(160,WORLD.h-160);m.aggro=null;}if(!m.alive)continue;
 let near=[...players.values()].filter(p=>Math.hypot(p.x-m.x,p.y-m.y)<230).sort((a,b)=>Math.hypot(a.x-m.x,a.y-m.y)-Math.hypot(b.x-m.x,b.y-m.y))[0];if(near){m.aggro=near.id;let d=Math.hypot(near.x-m.x,near.y-m.y);if(d>m.range){let dx=(near.x-m.x)/d,dy=(near.y-m.y)/d;m.x+=dx*(m.type==="goblin"?1.15:.85);m.y+=dy*(m.type==="goblin"?1.15:.85);}else if(now-m.lastAtk>1350){m.lastAtk=now;let damage=Math.max(2,m.atk-stat(near).def+rand(-2,3));near.hp-=damage;if(near.hp<=0){near.hp=near.maxHp;near.x=WORLD.w/2;near.y=WORLD.h/2;near.gold=Math.max(0,near.gold-10);let client=[...wss.clients].find(c=>c.readyState===1&&c._playerId===near.id);if(client)notice(client,"쓰러졌습니다. 마을에서 부활합니다. 골드 10을 잃었습니다.");}}}else m.aggro=null;}
+for(const p of players.values())savePlayer(p);
 let data=JSON.stringify(state());for(let c of wss.clients)if(c.readyState===1)c.send(data);},100);
-const port=process.env.PORT||3000;server.listen(port,"0.0.0.0",()=>console.log("BASAN RPG v2 running on "+port));
+const port=process.env.PORT||3000;server.listen(port,"0.0.0.0",()=>console.log("BASAN RPG v3 running on "+port));
